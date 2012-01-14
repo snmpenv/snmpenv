@@ -3,11 +3,15 @@
 = Getting Started =
 
 1. To load this environment from within a BASH shell perform:
+{{{
   source <path>/snmp_environment
+}}}
 
 Note: To have this enviroment automatically load whenever a new bash shell starts,
  add the following to your ~/.bashrc file:
+{{{
    [ -f <path>/snmp_environment ] && source <path>/snmp_environment
+}}}
 
 2. After loading the environment, to initialize it perform the following:
    s_init <MIBDIRS> <v2CommunityName> <target>
