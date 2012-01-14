@@ -1,0 +1,1146 @@
+#
+# snmp_environment - enhanced SNMP environment for BASH
+#
+#    Copyright (C) 2012 Christopher A. Doyle
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License along
+#    with this program; if not, write to the Free Software Foundation, Inc.,
+#    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+#
+# Features:
+#   - simple setup/configuration - no config files
+#   - functions that wrap Net-SNMP commands with common command options and
+#     target
+#   - command completion based on currently loaded MIB modules
+#   - new SNMP access commands not provided by Net-SNMP
+#   - various commands for verifying target agent behaviour
+#
+# This environment is useful in both interactive shells and in scripts.
+#
+# Getting Started:
+#
+# To have this enviroment automatically load whenever a new bash shell starts,
+# add the following to your ~/.bashrc file:
+#   [ -f <path>/snmp_environment ] && source <path>/snmp_environment
+#
+# After loading the environment, to initialize it perform the following:
+#   s_init <MIBDIRS> <v2CommunityName> <target>
+#   where:
+#     <MIBDIRS> is a colon-separated list of directories containing MIB files
+#     <v2CommunityName> is the V2c community name to access the target with (V1
+#        or V3 access is possible by issuing a subsequent s_setv* command
+#     <target> is the hostname or IP address of the target SNMP agent
+#
+# The command 's_vars' gives a list of the variables used by ths environment.
+#
+# For help use:
+#   s_help
+#
+# This environment requires Net-SNMP and libsmi. Use the command
+# 's_checkinstall' to verify that these dependencies have been installed.
+#
+# Miscellaneous Notes:
+#   1. In each directory listed in MIBDIRS, a file named .oids is
+# created/maintained by this environment (appropriate access rights to these
+# directories is thus required).  This file is used by some functions in this
+# environment and is also used to speed up the creation of command completions.
+# This file is created using libsmi, thus any SMI errors existing in the MIB
+# files located in these directories will affect the quality of the .oids file
+# (and thus the quality of the command completions).  The command s_smilint can
+# be used to check for SMI errors in these MIB files.
+#
+#   2. The following is the syntax used to describe function parameters:
+#   <MIB>            - a MIB module name e.g. IF-MIB
+#   <objectName>     - a MIB object name without module name (e.g. ifName)
+#   <MIB:objectName> - a MIB object name with module name (e.g. IF-MIB::ifName)
+#   <OID>            - a numeric object identifier (e.g. .1.3.6.1.2.1.2.2)
+#   <object>         - either <objectName> or <MIB:objectName> or <OID>
+#   <tableName>      - the name of a MIB object of type table or row
+#                      (e.g. ifTable or ifEntry)
+#
+# RELEASE 1.0
+
+
+## Constants ##
+
+# A list of what files located in MIBDIRS directories will not be considered MIB files.
+# Exclude any file starting with ., or ending with (~ or .bak).
+s_mibfile_excludemask="^[.]|~$|[.]bak$"
+
+
+## Internal helper Commands ##
+
+# s_i_mibdirs
+# Set the array s_arrays_mibdirs to a list of directories in $MIBDIRS.
+s_i_mibdirs () {
+ local IFS=:; s_array_mibdirs=( $@ );
+}
+
+# s_i_parse <item> [<item> ...]
+#   where '<item> [<item> ...]' is a list of options and/or parameters.  Note
+# that an option may require multiple items (e.g. -Cf + would require 2 items).
+#
+# Parser for Net-SNMP wrapper commands.  This function inserts $s_opt and
+# $s_target into the correct location within the list of items.  The correct
+# location to insert $s_opt is before the list, while the correct location to
+# insert $s_target is before first parameter (i.e. after the last option) in
+# the list.
+# This function assumes that all options are located before parameters in the
+# input list.
+s_i_parse () {
+  local opt i prev item
+  opt="y" # will be set to "n" when we think there are no more options left in list
+  i=1     # which <item> in the list is the current item (the first <item> is 1) 
+  prev="" # the first character of the previous <item> in the list
+  printf "%s " ${s_opt} | sed 's/ /\x00/g'
+  for item; do
+    # if first item doesn't start with -, then we know there are no options present
+    if [[ 1 -eq $i && "-" != ${item:0:1} ]]; then 
+      opt="n"
+      printf "%s\x00" "$s_target"
+    fi
+    printf "%s\x00" "$item"
+    if [ "y" = $opt ]; then
+      # There are no more options present when either
+      #   current item equals --
+      # or
+      #   the previous item started with - and both the current and next items both do not start with -
+      # or
+      #   the next item is the last in the list and does not start with -
+      if { [[ "--" == $item ]] ;} \
+      || { [[ 1 -ne $i && "-" == "${prev}" && "-" != "${item:0:1}" && ${@:i+1:1} =~ ^[^-] ]] ;} \
+      || { [[ $((i+1)) -eq $# && "${@:i+1:1}" =~ ^[^-] ]] ;} then
+        opt="n"
+        printf "%s\x00" "$s_target"
+      fi
+      prev="${item:0:1}"
+    fi
+    i=$((i+1))
+  done
+  if [ "y" = $opt ]; then
+    # no parameters were present (only options). Not really valid, but handle it anyway.
+    printf "%s\x00" "$s_target"
+  fi
+}
+
+# s_i_removeMiscSnmpOpts <snmpoptString>
+# Removes the following options from an snmpopt string:
+#   -v, -c, -l, -u, -a, -A, -x, -X
+s_i_removeMiscSnmpOpts () {
+  printf "%s " "$@" | sed 's/\(^\| \)*-[vcluaAxX][ ]*[^ ]*//g' | sed 's/[ ]*$//g' | sed 's/^[ ]*//g'
+}
+
+# s_i_cols withkeys|withoutkeys <MIB>::<tableName> [<index>]
+# Returns the parameters (incluse s_opt and s_target) required to access all of
+# columns belonging to <tableName> for the row with index <index>.
+# <index> is optional. If not supplied, then 0 is used as default.
+# The first parameter determines if the table keys should be included or not
+# in the generated list.
+# If no columns were found (i.e. <tableName> is not really a table), then
+# an empty string is returned.
+s_i_cols () {
+  local mib table cols keys key
+  mib=${2%%::*}
+  table=$(printf "%s\n" ${2##*::} | sed 's/Table$/Entry/g')
+  if [ withoutkeys = "$1" ]; then
+    # A list of columns that are keys
+    keys=$(smiquery node $mib::$table | sed -n '/^[ ]*Index: /,/^[ ]*Access: /p' | awk -F:: '/::/ {printf "%s ",$NF}')
+  else
+    keys=""
+  fi
+  # A list of all columns including keys.
+  cols=$(smiquery children $mib::$table | awk -F:: '{printf "%s ",$NF}')
+  if [ ! -z "$cols" ]; then
+    # remove from list of columns (cols), any columns that are keys
+    for key in ${keys}; do
+      cols=$(printf "%s\n" ${cols} | sed "s/\(^\| \)${key}\($\| \)/ /g")
+    done
+    printf "%s\n" "${s_opt} -Is .${3-0} -IS ${mib}:: ${s_target} ${cols}"
+  fi
+}
+
+# s_i_snmpexpectseterr <object> <oper> <value> <message>
+s_i_snmpexpectseterr ()  {
+  local rcvd
+  rcvd=$(snmpset ${s_opt//-O*E } -Ir $s_target "$1" "$2" "$3" 2>&1)
+  if [ "$rcvd" != "$4" ]; then
+    printf "%s\n" "FAILED: snmpset $1 $2 $3:" "expected:$4," "received:${rcvd}."
+  fi
+}
+
+
+## Commands - Net-SNMP wrappers ##
+
+s_snmpbulkget ()  { s_i_parse "$@" | xargs -0 snmpbulkget; }
+s_snmpbulkwalk () { s_i_parse "$@" | xargs -0 snmpbulkwalk; }
+s_snmpdelta ()    { s_i_parse "$@" | xargs -0 snmpdelta; }
+s_snmpget ()      { s_i_parse "$@" | xargs -0 snmpget; }
+s_snmpgetnext ()  { s_i_parse "$@" | xargs -0 snmpgetnext; }
+s_snmpset ()      { s_i_parse "$@" | xargs -0 snmpset; } 
+s_snmptable ()    { s_i_parse "$@" | xargs -0 snmptable; }
+s_snmpwalk ()     { s_i_parse "$@" | xargs -0 snmpwalk; }
+
+
+## Commands - Additional access ##
+
+# s_snmpgetnextrow <MIB>::<tableName> [<index>]
+s_snmpgetnextrow () {
+  local cols
+  cols=$(s_i_cols withoutkeys $1 $2)
+  [ -z "$cols" ] && printf "%s\n" "Table not defined." >&2 && return 1
+  snmpgetnext $cols
+}
+
+# s_snmpgetnextrow_withkeys <MIB>::<tableName> [<index>]
+s_snmpgetnextrow_withkeys () {
+  local cols
+  cols=$(s_i_cols withkeys $1 $2)
+  [ -z "$cols" ] && printf "%s\n" "Table not defined." >&2 && return 1
+  snmpgetnext $cols
+}
+
+# s_snmpgetrow <MIB>::<tableName> [<index>]
+s_snmpgetrow () {
+  local cols
+  cols=$(s_i_cols withoutkeys $1 $2)
+  [ -z "$cols" ] && printf "%s\n" "Table not defined." >&2 && return 1
+  snmpget $cols
+}
+
+# s_snmpgetrow_withkeys <MIB>::<tableName> [<index>]
+s_snmpgetrow_withkeys () {
+  local cols
+  cols=$(s_i_cols withkeys $1 $2)
+  [ -z "$cols" ] && printf "%s\n" "Table not defined." >&2 && return 1
+  snmpget $cols
+}
+
+
+## Commands - MIB information ##
+
+# s_smilint <MIB> [<MIB> ...]
+s_smilint () {
+  smilint "$@"
+}
+
+# s_snmpmibfilepath <MIB>
+s_snmpmibfilepath () {
+  smiquery module "$1" | awk -F': ' '/^[ ]*Pathname: / {print $2}'
+}
+
+# s_snmpgrep <searchString>
+s_snmpgrep () {
+  local s_array_mibdirs i dir
+  s_i_mibdirs "${MIBDIRS}"
+  pushd . > /dev/null
+  for i in `seq 0 $((${#s_array_mibdirs[@]}-1))`; do
+    dir=${s_array_mibdirs[i]}
+    [ ! -d "${dir}" ] && continue
+    cd "${dir}"
+    for file in *; do
+      [[ "${file}" =~ $s_mibfile_excludemask ]] && continue
+      grep -H -i "$@" -- "${dir}"/"${file}" 2>/dev/null
+    done
+  done
+  popd > /dev/null
+}
+
+# s_snmpinfo <object> [<object> ... ]
+# Note: <object> in <objectName> form (i.e. a MIB object name without
+# module name) is not currently supported because snmptranslate does not
+# support it.
+s_snmpinfo ()      {
+  local obj
+  for obj; do
+    snmptranslate -m ALL -Tp ${obj} 2> /dev/null
+    snmptranslate -m ALL -Td ${obj} 2> /dev/null
+  done
+}
+
+# s_snmpmibname [<objectName>]
+s_snmpmibname () {
+  local obj s_array_mibdirs i dir
+  if [ -n "$1" ]; then
+    obj="$1 "
+  else
+    obj="" # if <objectName> not supplied then return all MIBs
+  fi
+  s_i_mibdirs "${MIBDIRS}"
+  for i in `seq 0 $((${#s_array_mibdirs[@]}-1))`; do
+    dir=${s_array_mibdirs[i]}
+    [ ! -d "${dir}" ] && continue
+    grep "::${obj}" -- "${dir}"/.oids 2>/dev/null | awk -F:: '{print $1}' | sort | uniq
+  done
+}
+
+# s_snmptranslate <object> [<object> ...]
+# Note: <object> in <objectName> form (i.e. a MIB object name without
+# module name) is not currently supported because snmptranslate does not
+# support it.
+s_snmptranslate () {
+  local obj
+  for obj; do
+    snmptranslate -m ALL -OS ${obj} 2> /dev/null
+    snmptranslate -m ALL -On ${obj} 2> /dev/null
+  done
+}
+
+
+## Commands - Test ##
+
+# s_snmpauthfail
+s_snmpauthfail () {
+  snmpgetnext -m ALL -t1 -r0 -v 2c -c unknownCommunityName $s_target 1
+}
+
+# s_snmpchecktable <object>
+s_snmpchecktable () {
+  local opts nonBulk bulk
+  # Notes:
+  #   -Ob is used to ensure all indexes are displayed in printable characters
+  #   -Ox is used to ensure that strings are displayed as hex (unless specified
+  #       otherwise using a DISPLAY-HINT in the MIB)
+  #   -',' is used as column delimiter
+  opts='-Ci -Ob -Ox -Cf ,'
+  nonBulk=$(mktemp /tmp/snmpenv_snmpchecktable_nonBulk_XXXXXXXXXX)
+  bulk=$(mktemp /tmp/snmpenv_snmpchecktable_bulk_XXXXXXXXXX)
+  snmptable ${s_opt} -CB ${opts} ${s_target} $1 > $nonBulk
+  snmptable ${s_opt}     ${opts} ${s_target} $1 > $bulk
+  if ! diff -q "$nonBulk" "$bulk" > /dev/null ; then
+    printf "%s\n" "/--------------------"
+    printf "%s\n" "| s_snmpchecktable found difference in table $1:"
+    printf "%s\n" "|   non-bulk returned:"
+    cat ${nonBulk}
+    printf "%s\n" "|       bulk returned:"
+    cat ${bulk}
+    printf "%s\n" "| 'diff <non-bulk> <bulk>' is:"
+    diff "${nonBulk}" "${bulk}"
+    printf "%s\n" "\--------------------"
+  fi
+  rm -f ${nonBulk}
+  rm -f ${bulk}
+}
+
+# s_snmpcheckwalk <object>
+s_snmpcheckwalk () {
+  local curr line obj eof newObject get
+  # Notes:
+  #   -Ob is used to ensure all indexes are displayed in printable characters
+  #   -Ox is used to ensure that strings are displayed as hex (unless specified
+  #       otherwise using a DISPLAY-HINT in the MIB)
+  curr=""
+  s_snmpwalk -Ob -Ox -- "$1" | while : ; do
+    read line
+    eof=$?
+    # The following will be blank (i.e. sed matched) if line looks like it
+    # contains a new object (i.e. has the form '<OBJ> = <TYPE>:[ <VALUE>]'
+    # note an <OBJ> has to contain at least one '.' character.
+    newObject=$(printf "%s/n" "${line}" | sed 's/^[^ ]\+[.].*[^ ] = [^ ]\{3,20\}:.*$//g')
+    if [[ $eof != "0" || "${newObject}" == "" ]]; then
+      if [[ ! -z "${curr}" ]]; then
+        # remove trailing spaces to match same behaviour as in read command
+        get=$(s_snmpget -Ob -Ox -- ${obj} | sed 's/[ ]*$//g')
+        if [[ "${curr}" != "${get}" ]]; then
+          printf "%s\n" "/------------------"
+          printf "%s\n" "| s_snmpcheckwalk found difference at object ${obj}:"
+          printf "%s\n" "|   getnext returned: ${curr}."
+          printf "%s\n" "|       get returned: ${get}."
+          printf "%s\n" "\------------------"
+        fi
+      fi
+      [[ $eof != "0" ]] && break
+      curr="$line"
+      obj=$(printf "%s\n" "${curr}" | awk -F" = " '{print $1}')
+    else
+      curr=$(printf "%s\n" "${curr}" "${line}")
+    fi
+  done
+}
+
+# s_snmpexpectget <object> <value>
+s_snmpexpectget () {
+  local rcvd
+  rcvd=$(s_snmpget -Oq -Ov -- "$1")
+  if [[ "$rcvd" != "$2" ]]; then
+    printf "%s\n" "FAILED: snmpget $1:" "expected:$2," "received:${rcvd}."
+  fi
+}
+
+# s_snmpexpectgeterr_nosuchinst <object>
+s_snmpexpectgeterr_nosuchinst () {
+  s_opt="${s_opt} -Ir" s_snmpexpectget "$1" "No Such Instance currently exists at this OID"
+}
+
+# s_snmpexpectset <object> <oper> <value> [<object> <oper> <value> ...]
+s_snmpexpectset () {
+  [ $(($# % 3)) -ne 0 ] && printf "%s\n" "Invalid number of parameters." >&2 && return 1
+  s_snmpset "$@" >/dev/null
+  until [ "$#" -lt 3 ]; do
+    s_snmpexpectget "$1" "$3"
+    shift 3
+  done
+}
+
+s_snmpexpectseterr_commitfailed () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: commitFailed\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_genError () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: (genError) A general failure occured\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_inconsistentvalue () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: inconsistentValue (The set value is illegal or unsupported in some way)\nFailed object: $1\n\n")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_nocreation () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: noCreation (That table does not support row creation or that object can not ever be created)\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_nosuchname () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: (noSuchName) There is no such variable name in this MIB.\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_notwritable () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: notWritable (That object does not support modification)\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_wronglength () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: wrongLength (The set value has an illegal length from what the agent expects)\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+s_snmpexpectseterr_wrongvalue () {
+  local exp
+  exp=$(printf "%b" "Error in packet.\nReason: wrongValue (The set value is illegal or unsupported in some way)\nFailed object: $1")
+  s_i_snmpexpectseterr "$1" "$2" "$3" "${exp}"
+}
+
+# s_snmpwaitget <object> <value>
+s_snmpwaitget () {
+  until [ -z "$(s_snmpexpectget $@)" ]; do
+    sleep 0
+  done
+}
+
+
+## Commands - Administration ##
+
+# s_checkinstall
+s_checkinstall () {
+  [[ ! $(which smiquery) ]] && printf "%s\n" "Command smiquery not found."  >&2 && return 1
+  [[ ! $(which smidump)  ]] && printf "%s\n" "Command smidump not found."   >&2 && return 1
+  [[ ! $(which snmpwalk) ]] && printf "%s\n" "Net-SNMP commands not found." >&2 && return 1
+  printf "%s\n" "Installation is OK, all dependent commands were found."
+}
+
+# s_init [<MIBDIRS>] [<v2communityName>] [<target>]
+s_init () {
+  [ -n "$1" ] && MIBDIRS "$1"     # if <MIBDIRS> supplied, the use it
+  [ ! -v MIBDIRS ] && MIBDIRS ""  # if <MIBDIRS> has never been defined then define it to empty string
+  s_opt '-m ALL -t10 -r0 -OE'
+  s_setv2c "$2"
+  s_target "${3:-localhost}"
+}
+
+# s_opt [<optionsString>]
+s_opt () {
+  if [ $# -eq 0 ]; then
+    printf "%s\n" "${s_opt}"
+  else
+    s_opt=$*
+  fi
+}
+
+# s_rebuildDotOids
+s_rebuildDotOids () {
+  local s_array_mibdirs i dir file
+  s_i_mibdirs "${MIBDIRS}"
+  pushd . > /dev/null
+  for i in `seq 0 $((${#s_array_mibdirs[@]}-1))`; do
+    dir=${s_array_mibdirs[i]}
+    [ ! -d "${dir}" ] && continue
+    cd "${dir}"
+    rm -f .oids
+    for file in *; do
+      [[ "${file}" =~ $s_mibfile_excludemask ]] && continue
+      smidump -k -f identifiers -- "${file}" 2>/dev/null | awk '/^[^#]/ { if ($3 != "type") { printf "%s::%s %s\n", $1, $2, $3}}' >> .oids
+    done;
+  done
+  popd > /dev/null
+}
+
+# s_setv1 [<communityName>]
+s_setv1 () {
+  s_opt "$(s_i_removeMiscSnmpOpts "${s_opt}") -v 1 -c ${1:-userV1}"
+}
+
+# s_setv2c [<communityName>]
+s_setv2c () {
+  s_opt "$(s_i_removeMiscSnmpOpts "${s_opt}") -v 2c -c ${1:-userV2}"
+}
+
+# s_setv3 [<userName>]
+s_setv3 () {
+  s_opt "$(s_i_removeMiscSnmpOpts "${s_opt}") -v 3 -l noAuthNoPriv -u ${1:-userV3NoAuthNoPriv}"
+}
+
+# s_setv3a [<userName>] [MD5|SHA] [<authPword>]
+s_setv3a () {
+  s_opt "$(s_i_removeMiscSnmpOpts "${s_opt}") -v 3 -l authNoPriv -u ${1:-userV3AuthNoPriv} -a ${2:-MD5} -A ${3:-authPword}"
+}
+
+# s_setv3ap [<userName>] [MD5|SHA] [<authPword>] [DES|AES] [<privPword>]
+s_setv3ap () {
+  s_opt "$(s_i_removeMiscSnmpOpts "${s_opt}") -v 3 -l authPriv -u ${1:-userV3AuthPriv} -a ${2:-MD5} -A ${3:-authPword} -x ${4:-DES} -X ${5:-privPword}"
+}
+
+# s_target [<target>]
+s_target () {
+  if [ $# -eq 0 ]; then
+    printf "%s\n" "${s_target}"
+  else
+    s_target=$*
+  fi
+}
+
+# s_vars
+s_vars () {
+  printf "%s\n" "MIBDIRS  ${MIBDIRS}"
+  printf "%s\n" "SMIPATH  ${SMIPATH}"
+  printf "%s\n" "s_opt    ${s_opt}"
+  printf "%s\n" "s_target ${s_target}"
+}
+
+# MIBDIRS [<pathlist>]
+MIBDIRS () {
+  local s_array_mibdirs i dir file
+  if [ $# -eq 0 ]; then
+    printf "%s\n" "${MIBDIRS}"
+  else
+    MIBDIRS="$*"
+    SMIPATH="${MIBDIRS}"
+    s_i_mibdirs "${MIBDIRS}"
+    for i in `seq 0 $((${#s_array_mibdirs[@]}-1))`; do
+      dir=${s_array_mibdirs[i]}
+      [ ! -d "${dir}" ] && continue
+      # if .oids does not exist or (any file is newer than .oids) then rebuild
+      for file in "${dir}"/*; do
+       [ ! -e "${file}" ] && continue
+        if [ "${dir}"/.oids -ot "${file}" ]; then 
+          s_rebuildDotOids
+          break 2
+        fi
+      done
+    done
+  fi
+}
+
+# s_help [<command>]
+s_help () {
+  case "$1" in
+  s_init)
+    printf %s "\
+s_init [<MIBDIRS>] [<v2communityName>] [<target>]
+
+Initializes all environment variables.
+Note that this initializes the environment to using SNMPv2.  If a different
+protocol is desired, then one of the s_setv* commands may be used afterwards
+to change the environment to a different protocol version.
+If <MIBDIRS> is supplied, then the MIBDIRS environment variable is set to the
+supplied value.
+If <v2communityName> is supplied, then that community name is used (inserted
+into s_opt environment variable), otherwise the default value of 'userV2' is
+used.
+If <target> is supplied, then the s_target environment variable is set to the
+supplied value, otherwise the default value of 'localhost' is used.
+"
+    ;;
+  s_snmpset | \
+  s_snmpget | \
+  s_snmpgetnext | \
+  s_snmpbulkget | \
+  s_snmpbulkwalk | \
+  s_snmpwalk | \
+  s_snmpdelta | \
+  s_snmptable)
+    printf %s "\
+'$1 [<options>] <params>' is the same as performing
+'${1##s_} [<options>] \$s_opt \$s_target <params>'.
+
+Note command-specific options may be supplied as long as they immediately follow
+the command (i.e. are before the parameters).  It is recommended (but not always
+required) for a "--" to be supplied to indicate the end of options and start of
+parameters.
+"
+    ;;
+  s_snmpgetrow | s_snmpgetrow_withkeys)
+    printf %s "\
+s_snmpgetrow <MIB>::<tableName> [<index>]
+s_snmpgetrow_withkeys <MIB>::<tableName> [<index>]
+
+Perform a multi-variable snmpget access of all objects belonging to the row
+<index> of table <MIB>::<tableName>.
+Objects that are part of the key are not included.
+<index> is optional, if not supplied then zero is assumed.
+
+s_snmpgetrow_withkeys is the same as s_snmpgetrow but does not request any columns
+that are part of the index (i.e. keys).
+"
+    ;;
+  s_snmpgetnextrow | s_snmpgetnextrow_withkeys)
+    printf %s "\
+s_snmpgetnextrow <MIB>::<tableName> [<index>]
+s_snmpgetnextrow_withkeys <MIB>::<tableName> [<index>]
+
+Perform a multi-variable snmpgetnext access of all objects belonging to the
+row <index> of table <MIB>::<tableName>.
+Objects that are part of the key are not included.
+<index> is optional, if not supplied then zero is assumed.
+
+s_snmpgetnextrow_withkeys is the same as s_snmpgetnextrow but does not request
+any columns that are part of the index (i.e. keys).
+"
+    ;;
+  s_snmptranslate)
+    printf %s "\
+s_snmptranslate <object> [<object> ...]
+
+Outputs <object> in symbolic (name) and numeric (OID) format.
+"
+    ;;
+  s_snmpinfo)
+    printf %s "\
+s_snmpinfo <object> [<object> ... ]
+
+Outputs detailed information concerning MIB object(s).  Also output is a tree
+showing any child objects.
+"
+    ;;
+  s_snmpgrep)
+    printf %s "\
+s_snmpgrep <searchString>
+
+Search all MIB files in MIBDIRS directories for the string <searchString>.
+"
+    ;;
+  s_snmpmibname)
+    printf %s "\
+s_snmpmibname [<objectName>]
+
+Returns the name of MIB module(s) that <objectName> belongs to.
+If <objectName> is not supplied then a list of all MIB modules
+defined in MIBDIRS directories are returned.
+Note that object names may not be unique, thus there is a possibility
+that multiple MIB module names may be returned.
+"
+    ;;
+  s_snmpmibfilepath)
+    printf %s "\
+s_snmpmibfilepath <MIB>
+
+Returns the full path and file name of a MIB module.
+"
+    ;;
+  s_smilint)
+    printf %s "\
+s_smilint <MIB> [<MIB> ...]
+
+Perform smilint on the specified MIB module(s).
+See smilint man page for list of valid options.
+"
+    ;;
+  s_snmpcheckwalk)
+    printf %s "\
+s_snmpcheckwalk <object>
+
+Checks if get accesses match getnext accesses by
+performing a walk starting at <object>, then comparing
+this output to the output of a series of get accesses of
+the objects returned in the walk.
+If the accesses match, then no output is generated,
+otherwise for each failing object an error message is
+output showing the differing getnext and get values.
+"
+    ;;
+  s_snmpchecktable)
+    printf %s "\
+s_snmpchecktable <object>
+  where <object> is a table object.
+
+Checks if a bulk table walk matches a non-bulk table walk.
+If they match, then no output is generated, otherwise the output from both walks
+and a diff report are output.
+"
+    ;;
+  s_snmpwaitget)
+    printf %s "\
+s_snmpwaitget <object> <value>
+
+Continuously poll an object until it returns the expected value.
+"
+    ;;
+  s_snmpauthfail)
+    printf %s "\
+s_snmpauthfail
+
+Sends a V2c getnext request with an unknown community name to the target which
+should cause the target to generate an authorization failure notification
+(assuming that the target has been configured as such).
+This command assumes that 'unknownCommunityName' is not configured as an
+authorized v2c community on the target.
+"
+    ;;
+  s_snmpexpectget)
+    printf %s "\
+s_snmpexpectget <object> <value>
+
+Perform an snmpget access to <object> expecting to receive the value <value>.
+If the expected value is received then no output is returned, else an error
+message is returned.
+"
+    ;;
+  s_snmpexpectgeterr_nosuchinst)
+    printf %s "\
+s_snmpexpectgeterr_nosuchinst <object>
+
+Perform an snmpget access to <object> expecting it to fail with error
+noSuchInst.
+"
+    ;;
+  s_snmpexpectset)
+    printf %s "\
+s_snmpexpectset <object> <oper> <value> [<object> <oper> <value> ...]
+
+Perform an snmpset operation, followed by an snmpget, verifying that the value(s)
+read back matches the value(s) written.  If the values match, then no message is
+returned, otherwise an error message is returned.
+"
+    ;;
+  s_snmpexpectseterr_commitfailed | \
+  s_snmpexpectseterr_genError | \
+  s_snmpexpectseterr_inconsistentvalue | \
+  s_snmpexpectseterr_nocreation | \
+  s_snmpexpectseterr_nosuchname | \
+  s_snmpexpectseterr_notwritable | \
+  s_snmpexpectseterr_wronglength | \
+  s_snmpexpectseterr_wrongvalue)
+    printf %s "\
+s_snmpexpectseterr_commitfailed      <object> <oper> <value>
+s_snmpexpectseterr_nosuchname        <object> <oper> <value>
+s_snmpexpectseterr_wrongvalue        <object> <oper> <value>
+s_snmpexpectseterr_wronglength       <object> <oper> <value>
+s_snmpexpectseterr_notwritable       <object> <oper> <value>
+s_snmpexpectseterr_inconsistentvalue <object> <oper> <value>
+s_snmpexpectseterr_nocreation        <object> <oper> <value>
+s_snmpexpectseterr_genError          <object> <oper> <value>
+
+Perform an snmpset operation expecting it to fail with a error.
+"
+    ;;
+  s_rebuildDotOids)
+    printf %s "\
+s_rebuildDotOids
+
+Builds the .oids file in each MIB directory defined in MIBDIRS.
+The .oids file contains a list of all the MIB objects defined in the MIB files
+within that directory and is also used for command completion.
+This command should be performed when a MIB file has been added to, modified, or
+deleted from any directory in MIBDIRS.
+"
+    ;;
+  s_checkinstall)
+    printf %s "\
+s_checkinstall
+
+Checks if the installation has all required dependencies installed.
+"
+    ;;
+  s_help)
+    printf %s "\
+s_help [<command>]
+
+Displays help information concerning the specified command.  If no command
+is supplied then a brief summary of all available commands is given.
+"
+    ;;
+  s_vars)
+    printf %s "\
+s_vars
+
+Returns the current state of all variables.
+The following is a list of these variables:
+  MIBDIRS is used by net-snmp commands.
+  SMIPATH is used by libsmi commands (should be set identical to MIBDIRS).
+  s_opt specifies the common options to wrap around net-snmp commands. Refer
+    to the snmpcmd man page for a list of available options.
+  s_target which has format address[:port], specifies the target's IP address
+    or hostname and optional udp port number.
+"
+    ;;
+  s_opt)
+    printf %s "\
+s_opt [<optionsString>]
+
+Sets/gets the variable s_opt which specifies the common options to use with SNMP
+requests.  Refer to the snmpcmd man page for a list of available options.
+When no parameter is supplied, then get is assumed.
+"
+    ;;
+  s_target)
+    printf %s "\
+s_target [<target>]
+
+Sets/gets the variable s_target which specifies the target of SNMP requests.
+When no parameter is supplied, then get is assumed.
+The format of <target> is <address>[:<port>] where:
+ <address> may be either an IP address or a hostname
+ [:<port>] is optional - default port is 161
+"
+    ;;
+  MIBDIRS)
+    printf %s "\
+MIBDIRS [<pathlist>]
+
+Sets/gets the variable MIBDIRS which specifies directories that contain MIB
+files.
+When no parameter is supplied, then get is assumed.
+Note the format of <pathlist> is a colon-separated list of directory names.
+For set operations, the variable SMIPATH is set to be the same as the new
+MIBDIRS variable
+"
+    ;;
+  s_setv1 | \
+  s_setv2c | \
+  s_setv3 | \
+  s_setv3a | \
+  s_setv3ap )
+    printf %s "\
+s_setv1  [<v1CommunityName>]                       - Use SNMPv1 protocol.
+s_setv2c [<v2CommunityName>]                       - Use SNMPv2c protocol.
+s_setv3   [<v3UserName>]                           - Use SNMPv3 protocol without authentication or privacy.
+s_setv3a  [<v3aUserName>]  [MD5|SHA] [<authPword>] - Use SNMPv3 protocol with only authentication.
+s_setv3ap [<v3apUserName>] [MD5|SHA] [<authPword>] [DES|AES] [<privPword>] - Use SNMPv3 protocol with authentication and privacy.
+
+Sets s_opt to use the specified SNMP protocol version.
+The following default values are used for parameters that are not supplied:
+<v1CommunityName> - userV1
+<v2CommunityName> - userV2
+<v3UserName>      - userV3NoAuth
+<v3aUserName>     - userV3Auth
+<v3apUserName>    - userV3AuthPriv
+<authProtocol>    - MD5
+<authPword>       - authPword
+<privProtocol>    - DES
+<privPword>       - privPword
+"
+    ;;
+  "")
+    printf %s "\
+Available commands:
+
+Net-SNMP wrappers:
+  s_snmpbulkget  [<opts>] <params> - Same as 'snmpbulkget  [<opts>] \$s_opt \$s_target <params>'.
+  s_snmpbulkwalk [<opts>] <params> - Same as 'snmpbulkwalk [<opts>] \$s_opt \$s_target <params>'.
+  s_snmpdelta    [<opts>] <params> - Same as 'snmpdelta    [<opts>] \$s_opt \$s_target <params>'.
+  s_snmpget      [<opts>] <params> - Same as 'snmpget      [<opts>] \$s_opt \$s_target <params>'.
+  s_snmpgetnext  [<opts>] <params> - Same as 'snmpgetnext  [<opts>] \$s_opt \$s_target <params>'.
+  s_snmpset      [<opts>] <params> - Same as 'snmpset      [<opts>] \$s_opt \$s_target <params>'.
+  s_snmptable    [<opts>] <params> - Same as 'snmptable    [<opts>] \$s_opt \$s_target <params>'.
+  s_snmpwalk     [<opts>] <params> - Same as 'snmpwalk     [<opts>] \$s_opt \$s_target <params>'.
+
+Additional access commands:
+  s_snmpgetnextrow          <MIB>::<tableName> [<index>] - Perform snmpgetnext access requesting all objects in a row.
+  s_snmpgetnextrow_withkeys <MIB>::<tableName> [<index>] - Same as s_snmpgetnextrow, except that keys are also requested.
+  s_snmpgetrow              <MIB>::<tableName> [<index>] - Perform snmpget access requesting all objects in a row.
+  s_snmpgetrow_withkeys     <MIB>::<tableName> [<index>] - Same as s_snmpgetrow, except that keys are also requested. 
+
+MIB information commands:
+  s_smilint <MIB> [<MIB> ...]             - Perform smilint on the MIB module(s).
+  s_snmpmibfilepath <MIB>                 - Returns the full path and file name of a MIB module.
+  s_snmpgrep <searchString>               - Search all MIB files for lines matching <searchString>.
+  s_snmpinfo <object> [<object> ...]      - Outputs detailed information concerning specified object(s).
+  s_snmpmibname [<objectName>]            - Returns the name of MIB module(s) that <objectName> belongs to.
+  s_snmptranslate <object> [<object> ...] - Outputs <object> in name and numeric (OID) format.
+
+Test commands:
+  s_snmpauthfail                           - Sends a V2c getnext request with unknown community name to the target.
+  s_snmpchecktable <object>                - Checks if a bulk table walk matches a non-bulk table walk.
+  s_snmpcheckwalk <object>                 - Checks if get accesses match getnext accesses.
+  s_snmpexpectget <object> <value>         - Perform an snmpget access to <object> expecting to receive <value>.
+  s_snmpexpectgeterr_nosuchinst <object>   - Perform an snmpget access to <object> expecting a failure with error noSuchInstance.
+  s_snmpexpectset <object> <oper> <value> [<object> <oper> <value> ...] - Perform a set operation, followed by a read, expecting that the value read back matches the value written.
+  s_snmpexpectseterr_commitfailed      <object> <oper> <value> - Perform a set operation expecting a failure with error commitFailed.
+  s_snmpexpectseterr_genError          <object> <oper> <value> - Perform a set operation expecting a failure with error genError.
+  s_snmpexpectseterr_inconsistentvalue <object> <oper> <value> - Perform a set operation expecting a failure with error inconsistentValue.
+  s_snmpexpectseterr_nocreation        <object> <oper> <value> - Perform a set operation expecting a failure with error noCreation.
+  s_snmpexpectseterr_nosuchname        <object> <oper> <value> - Perform a set operation expecting a failure with error noSuchName.
+  s_snmpexpectseterr_notwritable       <object> <oper> <value> - Perform a set operation expecting a failure with error notWritable.
+  s_snmpexpectseterr_wronglength       <object> <oper> <value> - Perform a set operation expecting a failure with error wrongLength.
+  s_snmpexpectseterr_wrongvalue        <object> <oper> <value> - Perform a set operation expecting a failure with error wrongValue.
+  s_snmpwaitget  <object> <value>          - Continuously poll an object until it returns the expected value.
+
+Administration commands:
+  s_checkinstall                                    - Checks if the installation has all required dependencies installed.
+  s_help [<commandName>]                            - Displays help information.
+  s_init [<MIBDIRS>] [<v2communityName>] [<target>] - Initializes all environment variables.
+  s_opt                                             - Sets/gets the variable s_opt which specifies the options to use with SNMP requests.
+  s_rebuildDotOids                                  - Builds the .oids file within each MIB directory defined in MIBDIRS.
+  s_setv1  [<communityName>]                        - Set s_opt to use SNMPv1 protocol.
+  s_setv2c [<communityName>]                        - Set s_opt to use SNMPv2c protocol.
+  s_setv3   [<userName>]                            - Set s_opt to use SNMPv3 protocol without authentication or privacy.
+  s_setv3a  [<userName>] [MD5|SHA] [<authPword>]    - Set s_opt to use SNMPv3 protocol with only authentication.
+  s_setv3ap [<userName>] [MD5|SHA] [<authPword>] [DES|AES] [<privPWord>] - Set s_opt to use SNMPv3 protocol with authentication and privacy.
+  s_target [<target>]                               - Sets/gets the variable s_target which specifies the target of SNMP requests.
+  s_vars                                            - Returns the current state of all variables.
+  MIBDIRS [<pathlist>]                              - Sets/gets the variable MIBDIRS which specifies directories that contain MIB files.
+"
+    ;;
+  *)
+    printf %s "\
+Command $1 does not exist.
+"
+    ;;
+  esac
+}
+
+
+## Command Completion Support ##
+
+
+
+# _readDotOids <startPattern> [<objectType>] [<accessType>]
+# Searches the .oids file in each dir specified in $MIBDIRS for objects that
+# start with the pattern <startPattern> and that are restricted to the type(s)
+# specified in optional [objectType].
+# Possible values for [objectType] are any combination of
+# (column|compliance|group|node|notification|row|scalar|table), if [objectType]
+# is not supplied, then all items in .oids files are included,
+# The optional parameter [accessType] is used to used modify the search behavior
+# and/or output as follows:
+#   moduleNameOnly - search for only the name of MIB module (e.g. IF-MIB)
+#   noModuleName - search for a MIB object without the MIB module name (e.g. ifTable)
+#   specific - if found object is a scalar then append ".0" to object
+#   not supplied or any other value - searching for <MIB:Object> (e.g. IF-MIB::ifTable)
+_readDotOids () {
+  local s_array_mibdirs i dir
+  s_i_mibdirs "${MIBDIRS}"
+  for i in `seq 0 $((${#s_array_mibdirs[@]}-1))`; do
+    dir=${s_array_mibdirs[i]}
+    [ ! -d "${dir}" ] && continue
+    [ ! -e "${dir}"/.oids ] && continue
+    case "$3" in
+    moduleNameOnly)
+      egrep "^$1.*::" -- "${dir}"/.oids | awk -F:: '{printf "%s ", $1}'
+      ;;
+    noModuleName)
+      egrep "::$1.* " -- "${dir}"/.oids | awk '{print $1}' | awk -F:: '{printf "%s ", $2}'
+      ;;
+    specific)
+      if [[ "$1" =~ :: ]] ; then
+# The following is required because the character ':' is considered a word break.
+        egrep "^$1.* +$2" -- "${dir}"/.oids | sed 's/^.*:://g' | awk '{if ($2 == "scalar") {printf "%s.0 ", $1} else {printf "%s ", $1}}'
+      else
+        egrep "^$1.* +$2" -- "${dir}"/.oids | awk '{if ($2 == "scalar") {printf "%s.0 ", $1} else {printf "%s ", $1}}'
+      fi
+      ;;
+    *)
+      if [[ "$1" =~ :: ]] ; then
+# The following is required because the character ':' is considered a word break.
+        egrep "^$1.* +$2" -- "${dir}"/.oids | sed 's/^.*:://g' | awk '{printf "%s ", $1}'
+      else
+        egrep "^$1.* +$2" -- "${dir}"/.oids | awk '{printf "%s ", $1}'
+      fi
+      ;;
+    esac
+  done
+}
+
+# _handleColonWordBreaks
+# The following is a helper function to handle the character ':' (which is
+# considered a word break by bash) in <MIB>::<objectName>.
+_handleColonWordBreaks () {
+  if [ :: = "${COMP_WORDS[COMP_CWORD-1]}" ]; then
+    # if previous word is ::, then combine 2nd previous word, "::", and current word to form <MIB>::<partialObjectName>
+    printf "%s::%s" "${COMP_WORDS[COMP_CWORD-2]}" "${COMP_WORDS[COMP_CWORD]}"
+  elif [ :: = "${COMP_WORDS[COMP_CWORD]}" ]; then
+    # if current word is ::, then combine current word abd "::" to form <MIB>::
+    printf "%s::" "${COMP_WORDS[COMP_CWORD-1]}"
+  else
+    # if "::" has been then return whatever partial value has been entered so far for <MIB>
+    printf "%s" "${COMP_WORDS[COMP_CWORD]}"
+  fi
+}
+
+# _snmpcmd
+# Generates completions for most snmp commands.
+_snmpcmd () {
+  COMPREPLY=( $(compgen -W "$(_readDotOids $(_handleColonWordBreaks))") )
+}
+
+# _snmpspecific
+# Generates completions for object-specific commands (e.g s_snmpget, s_snmpset, s_snmpdelta).
+_snmpspecific () {
+  COMPREPLY=( $(compgen -W "$(_readDotOids $(_handleColonWordBreaks) '(column|scalar)' specific)") )
+}
+
+# _snmptable
+# Generates completions for table related commands (e.g. s_snmptable, s_snmpgetrow, etc.).
+_snmptable () {
+  COMPREPLY=( $(compgen -W "$(_readDotOids $(_handleColonWordBreaks) 'table')") )
+}
+
+# _snmpmibobj
+# Generates completions for commands that use only object name without the MIB module
+# name prefix (e.g. s_snmpmibname).
+_snmpmibobj () {
+  COMPREPLY=( $(compgen -W "$(_readDotOids ${COMP_WORDS[COMP_CWORD]} '' 'noModuleName')") )
+}
+
+# _snmpmib
+# Generates completions for commands that use only the MIB module name.
+_snmpmibmod () {
+  COMPREPLY=( $(compgen -W "$(_readDotOids ${COMP_WORDS[COMP_CWORD]} '' 'moduleNameOnly')") )
+}
+
+# _snmphelp
+# Generates completions for s_help command.
+_snmphelp () {
+  COMPREPLY=( $(compgen -W "$(declare -fx | awk '/declare -fx (MIBDIRS$|s_init|s_[^i][^_])/ {print $3}')") )
+}
+
+# complete -F definitions
+complete -F _snmpspecific -o nospace \
+s_snmpget \
+s_snmpset \
+s_snmpdelta \
+s_snmpwaitget \
+s_snmpexpectget \
+s_snmpexpectgeterr_nosuchinst \
+s_snmpexpectset \
+s_snmpexpectseterr_commitfailed \
+s_snmpexpectseterr_nosuchname \
+s_snmpexpectseterr_wrongvalue \
+s_snmpexpectseterr_wronglength \
+s_snmpexpectseterr_notwritable \
+s_snmpexpectseterr_inconsistentvalue \
+s_snmpexpectseterr_nocreation \
+s_snmpexpectseterr_genError
+
+complete -F _snmpcmd -o nospace \
+s_snmpgetnext \
+s_snmpbulkget \
+s_snmpbulkwalk \
+s_snmpwalk \
+s_snmpcheckwalk \
+s_snmptranslate \
+s_snmpinfo
+
+complete -F _snmptable \
+s_snmptable \
+s_snmpgetrow \
+s_snmpgetrow_withkeys \
+s_snmpgetnextrow \
+s_snmpgetnextrow_withkeys \
+s_snmpchecktable
+
+complete -F _snmpmibobj s_snmpmibname
+
+complete -F _snmpmibmod s_snmpmibfilepath s_smilint
+
+complete -F _snmphelp s_help
+
+## Export Functions ##
+
+# Export all functions that need to be exported.
+# (Command completion functions don't need exporting.)
+declare -fx \
+s_i_mibdirs \
+s_i_parse \
+s_i_removeMiscSnmpOpts \
+s_i_cols \
+s_i_snmpexpectseterr \
+s_snmpbulkget \
+s_snmpbulkwalk \
+s_snmpdelta \
+s_snmpget \
+s_snmpgetnext \
+s_snmpset \
+s_snmptable \
+s_snmpwalk \
+s_snmpgetnextrow \
+s_snmpgetnextrow_withkeys \
+s_snmpgetrow \
+s_snmpgetrow_withkeys \
+s_smilint \
+s_snmpmibfilepath \
+s_snmpgrep \
+s_snmpinfo \
+s_snmpmibname \
+s_snmptranslate \
+s_snmpauthfail \
+s_snmpchecktable \
+s_snmpcheckwalk \
+s_snmpexpectget \
+s_snmpexpectgeterr_nosuchinst \
+s_snmpexpectset \
+s_snmpexpectseterr_commitfailed \
+s_snmpexpectseterr_genError \
+s_snmpexpectseterr_inconsistentvalue \
+s_snmpexpectseterr_nocreation \
+s_snmpexpectseterr_nosuchname \
+s_snmpexpectseterr_notwritable \
+s_snmpexpectseterr_wronglength \
+s_snmpexpectseterr_wrongvalue \
+s_snmpwaitget \
+s_checkinstall \
+s_init \
+s_opt \
+s_rebuildDotOids \
+s_setv1 \
+s_setv2c \
+s_setv3 \
+s_setv3a \
+s_setv3ap \
+s_target \
+s_vars \
+MIBDIRS \
+s_help
+
+# Export all variables that need to be exported.
+declare -x \
+s_mibfile_excludemask \
+s_opt \
+s_target \
+MIBDIRS \
+SMIPATH
+
+## Initialization ##
+
+# Initialize variables to reasonable defaults
+s_init
+
