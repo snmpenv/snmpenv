@@ -14,7 +14,7 @@ Note: To have this enviroment automatically load whenever a new bash shell start
 }}}
 
 2. After loading the environment, to initialize it perform the following:
-{{{
+{{{<pre>
    s_init <MIBDIRS> <v2CommunityName> <target>
 }}}
    where:
