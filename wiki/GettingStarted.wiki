@@ -19,8 +19,9 @@ Note: To have this enviroment automatically load whenever a new bash shell start
 }}}
    where:
      {{{<MIBDIRS>}}} is a colon-separated list of directories containing MIB files
-     {{{<v2CommunityName>}}} is the V2c community name to access the target with (V1
-        or V3 access is possible by issuing a subsequent {{{s_setv*}}} command
+
+     {{{<v2CommunityName>}}} is the V2c community name to access the target with (V1 or V3 access is possible by issuing a subsequent {{{s_setv*}}} command)
+
      {{{<target>}}} is the hostname or IP address of the target SNMP agent
 
  The command 's_vars' gives a list of the variables used by ths environment.
@@ -29,10 +30,12 @@ Note: To have this enviroment automatically load whenever a new bash shell start
 
 1. For help use:
 {{{
-   s_help
+    s_help
 }}}
 
-2. This environment requires Net-SNMP and libsmi. Use the command
- 's_checkinstall' to verify that these dependencies have been installed.
+2. This environment requires Net-SNMP and libsmi. To verify that these dependencies have been installed, use the command:
+{{{
+    s_checkinstall
+}}}
 
 3. To configure the environment to use V1 or V3 of the SNMP protocol, use one of the {{{s_setv*}}} commands. 
