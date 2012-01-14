@@ -3,23 +3,21 @@
 = Getting Started =
 
 1. To load this environment from within a BASH shell perform:
-{{{
+<code language="xml">
   source <path>/snmp_environment
-}}}
+</code>
 
 Note: To have this enviroment automatically load whenever a new bash shell starts,
  add the following to your ~/.bashrc file:
-{{{
+<code language="xml">
    [ -f <path>/snmp_environment ] && source <path>/snmp_environment
-}}}
+</code>
 
 2. After loading the environment, to initialize it perform the following:
-<pre>
-{{{
+<code language="xml">
    s_init <MIBDIRS> <v2CommunityName> <target>
+</code>
 
-}}}
-</pre>
    where:
 {{{<MIBDIRS>}}} is a colon-separated list of directories containing MIB files
 
@@ -27,7 +25,7 @@ Note: To have this enviroment automatically load whenever a new bash shell start
 
 {{{<target>}}} is the hostname or IP address of the target SNMP agent
 
- The command 's_vars' gives a list of the variables used by ths environment.
+
 
 = Other information =
 
@@ -36,9 +34,14 @@ Note: To have this enviroment automatically load whenever a new bash shell start
     s_help
 }}}
 
-2. This environment requires Net-SNMP and libsmi. To verify that these dependencies have been installed, use the command:
+2. To get of a list of the variables used by the environment and their current value.  Use the command:
+{{{
+    s_vars
+}}}
+
+3. This environment requires Net-SNMP and libsmi. To verify that these dependencies have been installed, use the command:
 {{{
     s_checkinstall
 }}}
 
-3. To configure the environment to use V1 or V3 of the SNMP protocol, use one of the {{{s_setv*}}} commands. 
+4. To configure the environment to use V1 or V3 of the SNMP protocol, use one of the {{{s_setv*}}} commands. 
