@@ -14,11 +14,12 @@ Note: To have this enviroment automatically load whenever a new bash shell start
 }}}
 
 2. After loading the environment, to initialize it perform the following:
-{{{
 <pre>
+{{{
    s_init <MIBDIRS> <v2CommunityName> <target>
-</pre>
+
 }}}
+</pre>
    where:
 {{{<MIBDIRS>}}} is a colon-separated list of directories containing MIB files
 
