@@ -4,13 +4,13 @@
 
 1. To load this environment from within a BASH shell perform:
 <code language="xml">
-  source <path>/snmp_environment
+  source <path>/snmpenvrc
 </code>
 
 Note: To have this enviroment automatically load whenever a new bash shell starts,
  add the following to your ~/.bashrc file:
 <code language="xml">
-   [ -f <path>/snmp_environment ] && source <path>/snmp_environment
+   [ -f <path>/snmpenvrc ] && source <path>/snmpenvrc
 </code>
 
 2. After loading the environment, to initialize it perform the following:
