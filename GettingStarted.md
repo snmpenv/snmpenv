@@ -1,0 +1,48 @@
+# Getting Started #
+
+1. To load this environment from within a BASH shell perform:
+```xml
+
+source <path>/snmpenvrc
+```
+
+Note: To have this enviroment automatically load whenever a new bash shell starts,
+> add the following to your ~/.bashrc file:
+```xml
+
+[ -f <path>/snmpenvrc ] && source <path>/snmpenvrc
+```
+
+2. After loading the environment, to initialize it perform the following:
+```xml
+
+s_init <MIBDIRS> <v2CommunityName> <target>
+```
+
+> where:
+`<MIBDIRS>` is a colon-separated list of directories containing MIB files
+
+`<v2CommunityName>` is the V2c community name to access the target with (V1 or V3 access is possible by issuing a subsequent `s_setv*` command)
+
+`<target>` is the hostname or IP address of the target SNMP agent
+
+
+
+# Other information #
+
+1. For help use:
+```
+    s_help
+```
+
+2. To get of a list of the variables used by the environment and their current value.  Use the command:
+```
+    s_vars
+```
+
+3. This environment requires Net-SNMP and libsmi. To verify that these dependencies have been installed, use the command:
+```
+    s_checkinstall
+```
+
+4. To configure the environment to use V1 or V3 of the SNMP protocol, use one of the `s_setv*` commands.
